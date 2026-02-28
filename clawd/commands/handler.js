@@ -60,6 +60,9 @@ export default class CommandHandler {
       case 'stop':
         return this.handleStop(sessionKey)
 
+      case 'reindex':
+        return this.handleReindex(args)
+
       default:
         // Unknown command, pass to agent
         return { handled: false }
@@ -198,6 +201,55 @@ export default class CommandHandler {
     }
   }
 
+  async handleReindex(args) {
+    const indexer = this.gateway.agentRunner.agent.indexer
+
+    if (!indexer.enabled) {
+      return { handled: true, response: 'Indexing is not enabled. Set indexing.enabled: true in config.js' }
+    }
+
+    const installed = await indexer.checkInstalled()
+    if (!installed) {
+      return { handled: true, response: 'LEANN not found. Install with: uv tool install leann-core --with leann' }
+    }
+
+    if (indexer.indexing) {
+      return { handled: true, response: '⏳ Index build already in progress' }
+    }
+
+    const force = args.includes('--force')
+    const sourceName = args.replace('--force', '').trim()
+
+    if (sourceName) {
+      const source = indexer.sources.find(s => s.name === sourceName)
+      if (!source) {
+        const available = indexer.sources.map(s => s.name).join(', ')
+        return { handled: true, response: `Source "${sourceName}" not found. Available: ${available}` }
+      }
+
+      const result = await indexer.buildIndex(source, { force })
+      if (result.success) {
+        return { handled: true, response: `✅ Rebuilt "${source.name}" in ${result.elapsed}s` }
+      }
+      return { handled: true, response: `❌ Failed to build "${source.name}": ${result.error || result.reason}` }
+    }
+
+    // Build all
+    const results = await indexer.buildAll({ force })
+    const success = results.filter(r => r.success)
+    const failed = results.filter(r => !r.success)
+
+    const lines = [`🔄 Reindex complete: ${success.length}/${results.length} sources`]
+    for (const r of success) {
+      lines.push(`  ✅ ${r.source} (${r.elapsed}s)`)
+    }
+    for (const r of failed) {
+      lines.push(`  ❌ ${r.reason}`)
+    }
+
+    return { handled: true, response: lines.join('\n') }
+  }
+
   handleHelp() {
     const lines = [
       '📖 *Commands*',
@@ -209,6 +261,8 @@ export default class CommandHandler {
       '`/memory search <query>` - Search memories',
       '`/queue` - Show queue status',
       '`/stop` - Stop current operation',
+      '`/reindex` - Rebuild workspace index',
+      '`/reindex <source> --force` - Force rebuild a source',
       '`/help` - Show this help'
     ]
 

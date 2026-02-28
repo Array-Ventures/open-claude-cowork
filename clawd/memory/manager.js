@@ -2,17 +2,14 @@ import fs from 'fs'
 import path from 'path'
 import os from 'os'
 
-const WORKSPACE = process.env.CLAWD_WORKSPACE || path.join(os.homedir(), 'clawd')
-const MEMORY_DIR = path.join(WORKSPACE, 'memory')
-
 /**
  * Memory Manager for Clawd
  * Handles daily logs and curated long-term memory
  */
 export default class MemoryManager {
-  constructor() {
-    this.workspace = WORKSPACE
-    this.memoryDir = MEMORY_DIR
+  constructor(workspace) {
+    this.workspace = workspace || process.env.CLAWD_WORKSPACE || path.join(os.homedir(), 'clawd')
+    this.memoryDir = path.join(this.workspace, 'memory')
     this.ensureDirectories()
   }
 

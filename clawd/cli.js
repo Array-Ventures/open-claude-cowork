@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 
+import { loadEnvFile } from 'node:process'
+try { loadEnvFile() } catch {}
+
 import { createInterface } from 'readline'
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs'
 import { fileURLToPath } from 'url'
 import path from 'path'
+import os from 'os'
 import { execSync } from 'child_process'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -144,9 +148,28 @@ async function terminalChat() {
 
     // Create agent
     const agent = new ClaudeAgent({
-      allowedTools: config.agent?.allowedTools || ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-      maxTurns: config.agent?.maxTurns || 50
+      workspace: config.agent?.workspace,
+      allowedTools: config.agent?.allowedTools || [],
+      maxTurns: config.agent?.maxTurns || 50,
+      indexing: config.indexing,
     })
+
+    // Initialize workspace indexing
+    if (config.indexing?.enabled) {
+      const indexer = agent.indexer
+      const installed = await indexer.checkInstalled()
+
+      if (installed) {
+        const leannConfig = indexer.getLeannMcpServerConfig()
+        if (leannConfig) {
+          mcpServers.leann = leannConfig
+          print('  ✅ LEANN indexing ready', colors.green)
+        }
+
+        // Build + watch all sources (fire and forget)
+        indexer.startWatchers().catch(() => {})
+      }
+    }
 
     // Handle cron job executions in terminal
     agent.cronScheduler.on('execute', async ({ jobId, message, invokeAgent }) => {
@@ -204,6 +227,7 @@ async function terminalChat() {
       if (['exit', 'quit', '/exit', '/quit'].includes(input.trim().toLowerCase())) {
         print('\nGoodbye!\n', colors.red)
         agent.stopCron()
+        agent.indexer.stopWatchers()
         break
       }
 
@@ -360,7 +384,7 @@ async function setupWhatsApp() {
   print('\n📱 WhatsApp Setup\n', colors.green)
 
   // Check if already authenticated
-  const waAuthPath = path.join(__dirname, 'auth_whatsapp')
+  const waAuthPath = path.join(os.homedir(), '.clawd', 'auth', 'whatsapp')
   if (existsSync(waAuthPath)) {
     print('✅ WhatsApp is already authenticated!\n', colors.green)
     const reauth = await prompt('Re-authenticate (scan new QR)? (y/n): ')
@@ -601,10 +625,10 @@ async function setupClawdBrowser() {
     print('  ✅ Chromium found\n', colors.green)
   }
 
-  const customPath = await prompt('Custom profile path (press Enter for default ~/.clawd-browser-profile): ')
+  const customPath = await prompt('Custom profile path (press Enter for default ~/.clawd/browser-profile): ')
   const headlessChoice = await prompt('Run headless (no visible window)? (y/n, default: n): ')
 
-  const userDataDir = customPath.trim() || '~/.clawd-browser-profile'
+  const userDataDir = customPath.trim() || '~/.clawd/browser-profile'
   const headless = headlessChoice.toLowerCase() === 'y'
 
   await updateBrowserConfig({
@@ -681,7 +705,7 @@ async function updateBrowserConfig(updates) {
     enabled: ${updates.enabled},
     mode: '${escapeQuotes(updates.mode) || 'clawd'}',
     clawd: {
-      userDataDir: '${escapeQuotes(updates.clawd?.userDataDir) || '~/.clawd-browser-profile'}',
+      userDataDir: '${escapeQuotes(updates.clawd?.userDataDir) || '~/.clawd/browser-profile'}',
       headless: ${updates.clawd?.headless ?? false}
     },
     chrome: {
@@ -749,7 +773,7 @@ async function testConnection() {
   print('\n🔍 Testing Connections...\n', colors.cyan)
 
   // Check WhatsApp auth
-  const waAuthPath = path.join(__dirname, 'auth_whatsapp')
+  const waAuthPath = path.join(os.homedir(), '.clawd', 'auth', 'whatsapp')
   if (existsSync(waAuthPath)) {
     print('  WhatsApp: ✅ Auth folder exists', colors.green)
   } else {

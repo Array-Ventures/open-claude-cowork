@@ -1,3 +1,6 @@
+import { loadEnvFile } from 'node:process'
+try { loadEnvFile() } catch {}
+
 import config from './config.js'
 import WhatsAppAdapter from './adapters/whatsapp.js'
 import iMessageAdapter from './adapters/imessage.js'
@@ -16,8 +19,10 @@ class Gateway {
   constructor() {
     this.sessionManager = new SessionManager()
     this.agentRunner = new AgentRunner(this.sessionManager, {
-      allowedTools: config.agent?.allowedTools || ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
-      maxTurns: config.agent?.maxTurns || 50
+      workspace: config.agent?.workspace,
+      allowedTools: config.agent?.allowedTools || [],
+      maxTurns: config.agent?.maxTurns || 50,
+      indexing: config.indexing,
     })
     this.commandHandler = new CommandHandler(this)
     this.adapters = new Map()
@@ -132,13 +137,33 @@ class Gateway {
     console.log('Clawd Gateway Starting')
     console.log('='.repeat(50))
     console.log(`Agent ID: ${config.agentId}`)
-    console.log(`Workspace: ~/clawd/`)
+    console.log(`Workspace: ${config.agent?.workspace || '~/clawd'}`)
     console.log('')
 
     await this.initMcpServers()
     this.agentRunner.setMcpServers(this.mcpServers)
 
     this.agentRunner.agent.gateway = this
+
+    // Initialize workspace indexing
+    if (config.indexing?.enabled) {
+      const indexer = this.agentRunner.agent.indexer
+      const installed = await indexer.checkInstalled()
+
+      if (installed) {
+        const leannConfig = indexer.getLeannMcpServerConfig()
+        if (leannConfig) {
+          this.mcpServers.leann = leannConfig
+          this.agentRunner.setMcpServers(this.mcpServers)
+          console.log('[Indexing] LEANN MCP server registered')
+        }
+
+        // Build + watch all sources (fire and forget)
+        indexer.startWatchers().catch(err => {
+          console.error('[Indexing] Failed to start watchers:', err.message)
+        })
+      }
+    }
 
     // Initialize WhatsApp adapter
     if (config.whatsapp.enabled) {
@@ -283,8 +308,9 @@ class Gateway {
   async stop() {
     console.log('\n[Gateway] Shutting down...')
 
-    // Stop cron scheduler
+    // Stop cron scheduler and indexing watchers
     this.agentRunner.agent.stopCron()
+    this.agentRunner.agent.indexer.stopWatchers()
 
     // Stop browser server
     if (this.browserServer) {

@@ -7,11 +7,10 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal'
 import pino from 'pino'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import os from 'os'
 import BaseAdapter from './base.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const AUTH_DIR = path.join(__dirname, '..', 'auth_whatsapp')
+const AUTH_DIR = path.join(os.homedir(), '.clawd', 'auth', 'whatsapp')
 
 /**
  * WhatsApp adapter using Baileys

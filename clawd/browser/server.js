@@ -40,7 +40,7 @@ export default class BrowserServer {
    */
   async startClawdBrowser() {
     const clawdConfig = this.config.clawd || {}
-    let userDataDir = clawdConfig.userDataDir || '~/.clawd-browser-profile'
+    let userDataDir = clawdConfig.userDataDir || '~/.clawd/browser-profile'
 
     // Expand ~ to home directory
     if (userDataDir.startsWith('~')) {
