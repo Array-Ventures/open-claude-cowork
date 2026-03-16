@@ -141,6 +141,17 @@ vite.config.ts.timestamp-*
 .vite/
 
 .DS_Store
+.agents/
 .claude/
 .leann/
 docs/
+
+# Data files (sensitive fund data)
+*.xlsx
+
+# Test scripts
+clawd/test-*.js
+clawd/test-*.sh
+
+# Obsolete (replaced by nanograph graph)
+clawd/memory-seed/
