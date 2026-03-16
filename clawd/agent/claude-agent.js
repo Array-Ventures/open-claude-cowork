@@ -1,15 +1,21 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { EventEmitter } from "events";
 import path from "path";
 import os from "os";
+
+import { getClaudeProjectDir } from "../utils.js";
 import MemoryManager from "../memory/manager.js";
 import {
   createCronMcpServer,
   setContext as setCronContext,
   getScheduler,
 } from "../tools/cron.js";
-import { createGatewayMcpServer, setGatewayContext } from "../tools/gateway.js";
+import { createGatewayMcpServer, setGatewayContext, getGatewayContext } from "../tools/gateway.js";
+import { createBrowserMcpServer } from "../browser/index.js";
+import { createLinkedinMcpServer } from "../linkedin/server.js";
+// Obsidian removed — memory is now nanograph at ~/clawd/graph/
 import { WorkspaceIndexer } from "../indexing/index.js";
+import SessionStore from "../sessions/store.js";
 
 /**
  * Resolve workspace path (handles ~/ prefix)
@@ -23,9 +29,11 @@ function resolveWorkspace(workspace) {
 }
 
 /**
- * Build the system prompt with memory system info
+ * Build the append prompt with Clawd-specific instructions.
+ * This is appended to Claude Code's default system prompt (which includes auto memory,
+ * built-in tool instructions, etc.)
  */
-function buildSystemPrompt(memoryContext, sessionInfo, cronInfo, workspace) {
+function buildAppendPrompt(sessionInfo, cronInfo, workspace, outputMode = 'interactive') {
   const now = new Date();
   const dateStr = now.toLocaleDateString("en-US", {
     weekday: "long",
@@ -35,89 +43,47 @@ function buildSystemPrompt(memoryContext, sessionInfo, cronInfo, workspace) {
   });
   const timeStr = now.toLocaleTimeString("en-US", { hour12: true });
 
-  return `You are Clawd, a personal AI assistant communicating via messaging platforms (WhatsApp, iMessage).
+  const outputModeText = outputMode === 'silent'
+    ? `## Output Mode: SILENT
+You are running in silent mode — no user is waiting for a response. Your text output is NOT sent to anyone.
+To send a message, you MUST use mcp__gateway__send_message with the target platform and chat_id.`
+    : `## Output Mode: INTERACTIVE
+Your text responses are automatically sent to the current chat. Do NOT use mcp__gateway__send_message to reply to the current conversation — only use it to proactively message a DIFFERENT chat.`;
+
+  return `# Clawd — Personal AI Assistant
+
+You are Clawd, a personal AI assistant communicating via messaging platforms (WhatsApp, iMessage).
 
 ## Current Context
 - Date: ${dateStr}
 - Time: ${timeStr}
 - Session: ${sessionInfo.sessionKey}
 - Platform: ${sessionInfo.platform}
+- Workspace: ${workspace}/
+- Memory: ${getClaudeProjectDir(workspace)}/memory/
 
-## Memory System
-
-You have access to a persistent memory system. Use it to remember important information across conversations.
-
-### Memory Structure
-- **MEMORY.md**: Curated long-term memory for important facts, preferences, and decisions
-- **memory/YYYY-MM-DD.md**: Daily notes (append-only log for each day)
-
-### When to Write Memory
-- **Immediately write** when the user says "remember this" or similar
-- **Write to MEMORY.md** for: preferences, important decisions, recurring information, relationships, key facts
-- **Write to daily log** for: tasks completed, temporary notes, conversation context, things that happened today
-
-### Memory Tools
-- Use \`Read\` tool to read memory files from ${workspace}/
-- Use \`Write\` or \`Edit\` tools to update memory files
-- Workspace path: ${workspace}/
-
-### Memory Writing Guidelines
-1. Be concise but include enough context to be useful later
-2. Use markdown headers to organize information
-3. Include dates when relevant
-4. For MEMORY.md, organize by topic/category
-5. For daily logs, use timestamps
-
-## Current Memory Context
-${memoryContext || "No memory files found yet. Start building your memory!"}
+${outputModeText}
 
 ## Scheduling / Reminders
+- "remind me in X": use schedule_delayed with the reminder text as the message
+- "every day at 9am": use schedule_cron with "0 9 * * *"
+- invoke_agent=false (default): sends the message text directly to the chat — use for simple reminders like "Take your medicine!"
+- invoke_agent=true: wakes you (the agent) to process the message as a task and respond
+- silent=true + invoke_agent=true: runs you in the background — you decide whether to message anyone using send_message. Good for background checks and monitoring tasks.
+- silent=true requires invoke_agent=true (will error otherwise — silent only makes sense when the agent runs)
+- All schedule tools accept optional platform and chat_id to route notifications to a specific chat (defaults to current)
 
-You have cron tools to schedule messages:
-- \`mcp__cron__schedule_delayed\`: One-time reminder after delay (seconds)
-- \`mcp__cron__schedule_recurring\`: Repeat at interval (seconds)
-- \`mcp__cron__schedule_cron\`: Cron expression (minute hour day month weekday)
-- \`mcp__cron__list_scheduled\`: List all scheduled jobs
-- \`mcp__cron__cancel_scheduled\`: Cancel a job by ID
-
-When user says "remind me in X minutes/hours", use schedule_delayed.
-When user says "every day at 9am", use schedule_cron with "0 9 * * *".
+## Triggers (Event-Driven)
+- Use schedule_trigger to enable real-time event triggers (new email, GitHub commit, etc.)
+- Use list_triggers to see available triggers and their status
+- Triggers default to silent=true + invoke_agent=true — you wake up, assess the event, decide whether to notify the user
+- Cancel triggers with cancel_scheduled using the job ID (e.g., trigger_GMAIL_NEW_MESSAGE)
 
 ### Current Scheduled Jobs
 ${cronInfo || "No jobs scheduled"}
 
 ## Image Handling
-
-When the user sends an image, you will receive it in your context. You can:
-- Describe what you see in the image
-- Answer questions about the image
-- Extract text from images (OCR)
-- Analyze charts, diagrams, screenshots
-
-## Communication Style
-- Be helpful and conversational
-- Keep responses concise for messaging (avoid walls of text)
-- DO NOT use markdown formatting (no **, \`, #, -, etc.) - messaging platforms don't render it
-- Use plain text only - write naturally without formatting syntax
-- Use emoji sparingly and appropriately
-- Remember context from the conversation
-- Proactively use tools when needed
-- DO NOT mention details about connected accounts (emails, usernames, account IDs) unless explicitly asked - just perform the action silently
-
-## Available Tools
-Built-in: Read, Write, Edit, Bash, Glob, Grep, TodoWrite, Skill
-Scheduling: mcp__cron__schedule_delayed, mcp__cron__schedule_recurring, mcp__cron__schedule_cron, mcp__cron__list_scheduled, mcp__cron__cancel_scheduled
-Gateway: mcp__gateway__send_message, mcp__gateway__list_platforms, mcp__gateway__get_queue_status, mcp__gateway__get_current_context, mcp__gateway__list_sessions, mcp__gateway__broadcast_message
-Composio: Access to 500+ app integrations (Gmail, Slack, GitHub, Google Sheets, etc.) via Composio MCP tools
-Browser: Browser automation via mcp__browser tools (see below)
-
-## Gateway Tools
-- \`mcp__gateway__send_message\`: Send a message to any chat on any platform
-- \`mcp__gateway__list_platforms\`: List connected platforms
-- \`mcp__gateway__get_queue_status\`: Check message queue status
-- \`mcp__gateway__get_current_context\`: Get current platform/chat/session info
-- \`mcp__gateway__list_sessions\`: List all active sessions
-- \`mcp__gateway__broadcast_message\`: Send to multiple chats (use carefully)
+When the user sends an image, you can describe it, answer questions, extract text (OCR), or analyze charts/diagrams/screenshots.
 
 ## Tool Selection - IMPORTANT
 
@@ -126,53 +92,72 @@ For tasks involving Gmail, Slack, GitHub, Google Sheets, Calendar, Notion, Trell
 
 **Browser tools are ONLY for when the user explicitly mentions:**
 - "browser", "browse", "open website", "go to site", "navigate to"
-- "web page", "webpage", "website"
 - Specific URLs they want to visit
 - Tasks that require visual interaction with a website that Composio cannot handle
 
 Examples:
 - "Send an email to John" → Use Composio (Gmail tools)
-- "Check my GitHub notifications" → Use Composio (GitHub tools)
 - "Open google.com in the browser" → Use Browser tools
-- "Browse to twitter.com and take a screenshot" → Use Browser tools
-- "Post a message in Slack" → Use Composio (Slack tools)
-- "Go to amazon.com and search for headphones" → Use Browser tools
 
-## Browser Tools (only when explicitly requested)
-  - browser_status: Get browser status (running, mode, current URL, tab count)
-  - browser_navigate: Navigate to a URL
-  - browser_snapshot: Get accessibility tree snapshot (returns elements with [ref=eN] identifiers for targeting)
-  - browser_screenshot: Take a screenshot of the current page
-  - browser_click: Click element by ref (e.g., "e5") or text description (e.g., "Submit button")
-  - browser_type: Type text into input fields (use ref or field name/placeholder)
-  - browser_press: Press keyboard keys (e.g., "Enter", "Tab", "Escape")
-  - browser_select: Select dropdown options
-  - browser_wait: Wait for element or text to appear
-  - browser_tabs: List all open tabs
-  - browser_switch_tab: Switch to a tab by index
-  - browser_new_tab: Open a new tab
-  - browser_close_tab: Close current tab
-  - browser_back: Go back in history
-  - browser_forward: Go forward in history
-  - browser_reload: Reload the page
+## Gateway Tools
+- mcp__gateway__send_message: Send a message to any chat on any platform (use ONLY for messaging a different chat, or in silent mode)
+- mcp__gateway__list_platforms: List connected platforms
+- mcp__gateway__get_queue_status: Check message queue status
+- mcp__gateway__get_current_context: Get current platform/chat/session info
+- mcp__gateway__list_sessions: List all active sessions
+- mcp__gateway__broadcast_message: Send to multiple chats (use carefully)
 
-### Browser Workflow (when needed)
-1. Use browser_navigate to go to a URL
-2. Use browser_snapshot to see the page structure and get element refs
-3. Use browser_click/browser_type with refs (e.g., "e5") or descriptions to interact
-4. Take browser_screenshot to verify visual state if needed
+## Knowledge Tools
+Use mcp__knowledge__* tools to search across workspace files, transcripts, and memories.
+When user asks to find, recall, or search for something from past conversations or files, use Knowledge tools.
 
-## Important
-- The workspace at ${workspace}/ is your home - use it to store files and memory
-- Always check memory before asking the user for information they may have already told you
-- Update memory when you learn new persistent information about the user
-- When user asks to be reminded, use the cron scheduling tools
+## LinkedIn Tools
+Use mcp__linkedin__* tools for LinkedIn messaging and connections.
+- list_linkedin_chats: List recent LinkedIn DM conversations (filter by unread)
+- read_linkedin_messages: Read messages from a specific chat
+- send_linkedin_message: Reply in an existing chat (requires approval)
+- start_linkedin_chat: Start a new conversation (requires approval)
+- get_linkedin_attendees: Get attendee profiles — name, role, connection degree, LinkedIn URL
+- list_received_invitations: List pending connection requests received
+- list_sent_invitations: List pending sent connection requests
+- send_connection_request: Send a connection request with optional note (requires approval)
+- respond_to_invitation: Accept or decline a connection request (requires approval)
+When user asks about LinkedIn messages, DMs, connections, or invitations, use these tools.
 
-## Platform Switching / Starting Gateway
-When the user says things like "can I text you on WhatsApp?" or "I'm going outside, let me message you on WhatsApp":
-- This means they want to continue the conversation on WhatsApp
-- Tell the user the gateway needs to be started manually for now: \`cd ~/Downloads/Parth/open-claude-cowork/clawd && npm start\`
-- A gateway control tool will be available soon to start/stop the gateway directly
+## Agency Tools
+Use mcp__agency__* tools for CRM data — companies, people, meetings, emails, opportunities.
+When user asks about contacts, deals, companies, or meeting notes, use Agency tools.
+
+## Memory System
+Your memory is a nanograph property graph at \`~/clawd/graph/\`. This is what makes you *you* across conversations. Every person you meet, every deal you track, every decision the fund makes lives here.
+
+MEMORY.md has the quick-reference aliases. The **joyce-graph** skill has full schema, queries, and mutation workflows — load it before any graph operation.
+
+**Be proactive:** Don't wait to be asked to remember things. When someone mentions a person, search the graph. When a deal progresses, advance it. When metrics come in, add them. Your memory is what makes you useful.
+
+**Reading the graph:**
+\`\`\`
+cd ~/clawd/graph
+nanograph run pipeline          # pending deals
+nanograph run ours              # deals where Array owes next move
+nanograph run why deal-<slug>   # trace a deal's provenance
+nanograph run metrics           # latest portco metrics
+nanograph run search "query"    # semantic search
+\`\`\`
+
+**Writing to the graph:**
+Load /joyce-graph skill and read its mutations.md reference. Key workflows:
+- New cold inbound: insert_company + insert_deal + link_deal_for (no spine needed)
+- New warm intro: full spine — Artifact + Signal + Decision + edges
+- Advance deal: advance_deal + Signal + Decision
+- Pass: close_deal + set_pass_date + Decision
+- Metrics: unset old isLatest, insert new, set new isLatest, link_metrics_for
+
+**Key rules:**
+- Timestamps auto-set via now() — never pass createdAt/updatedAt
+- Shruti forwarding to deals@ is standard funnel entry, not a signal of interest
+- passDate != stageDate — stageDate is when deal entered stage, passDate is when pass email was sent
+- Slug conventions: per-{first}-{last}, com-{name}, deal-{name}, port-{name}-{yyyy-mm}, met-{name}-{period}
 `;
 }
 
@@ -184,14 +169,26 @@ export default class ClaudeAgent extends EventEmitter {
   constructor(config = {}) {
     super();
     this.workspace = resolveWorkspace(config.workspace);
-    this.memoryManager = new MemoryManager(this.workspace);
-    this.cronMcpServer = createCronMcpServer();
+
+    // Seed auto memory + CLAUDE.md if they don't exist yet
+    const srcRoot = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
+    this.srcRoot = srcRoot;
+    this.memoryManager = new MemoryManager(this.workspace, srcRoot);
+    this.memoryManager.seed();
+    this.memoryManager.seedSkills();        // async: git clone latest skills
+    // Obsidian headless sync removed — memory is nanograph
+
     this.cronScheduler = getScheduler();
-    this.gatewayMcpServer = createGatewayMcpServer();
     this.indexer = new WorkspaceIndexer(this.workspace, config.indexing || {});
+    // Add auto memory as an indexable source
+    this.indexer.sources.push({
+      name: 'memory',
+      type: 'directory',
+      path: getClaudeProjectDir(this.workspace) + '/memory',
+    });
     this.leannMcpServer = this.indexer.getLeannMcpServerConfig();
     this.gateway = null; // Set by gateway after construction
-    this.sessions = new Map();
+    this.sessions = new SessionStore();
     this.abortControllers = new Map();
 
     // allowedTools = auto-approved tools (skip ALL permission checks).
@@ -199,51 +196,8 @@ export default class ClaudeAgent extends EventEmitter {
     // go through permission rules (deny/allow) + canUseTool callback.
     this.allowedTools = config.allowedTools || [];
 
-    // Add cron MCP tools to allowed list
-    this.cronTools = [
-      "mcp__cron__schedule_delayed",
-      "mcp__cron__schedule_recurring",
-      "mcp__cron__schedule_cron",
-      "mcp__cron__list_scheduled",
-      "mcp__cron__cancel_scheduled",
-    ];
-
-    // Add gateway MCP tools to allowed list
-    this.gatewayTools = [
-      "mcp__gateway__send_message",
-      "mcp__gateway__list_platforms",
-      "mcp__gateway__get_queue_status",
-      "mcp__gateway__get_current_context",
-      "mcp__gateway__list_sessions",
-      "mcp__gateway__broadcast_message",
-    ];
-
-    // Add LEANN indexing tools to allowed list
-    this.indexingTools = [
-      "mcp__leann__leann_search",
-      "mcp__leann__leann_list",
-    ];
-
-    // Add browser MCP tools to allowed list
-    this.browserTools = [
-      "mcp__browser__browser_navigate",
-      "mcp__browser__browser_snapshot",
-      "mcp__browser__browser_screenshot",
-      "mcp__browser__browser_click",
-      "mcp__browser__browser_type",
-      "mcp__browser__browser_press",
-      "mcp__browser__browser_select",
-      "mcp__browser__browser_wait",
-      "mcp__browser__browser_tabs",
-      "mcp__browser__browser_switch_tab",
-      "mcp__browser__browser_new_tab",
-      "mcp__browser__browser_close_tab",
-      "mcp__browser__browser_back",
-      "mcp__browser__browser_forward",
-      "mcp__browser__browser_reload",
-      "mcp__browser__browser_status",
-    ];
-
+    this.hitl = config.hitl || null;
+    this.model = config.model || undefined;
     this.maxTurns = config.maxTurns || 50;
     this.permissionMode = config.permissionMode || "default";
 
@@ -328,11 +282,13 @@ export default class ClaudeAgent extends EventEmitter {
       chatId = null,
       image = null,
       mcpServers = {},
+      outputMode = "interactive",
     } = params;
 
     const session = this.getSession(sessionKey);
     session.lastActivity = Date.now();
     session.messageCount++;
+    this.sessions.save();
 
     // Set cron context for scheduled messages
     setCronContext({ platform, chatId, sessionKey });
@@ -345,24 +301,36 @@ export default class ClaudeAgent extends EventEmitter {
       currentSessionKey: sessionKey,
     });
 
-    // Build system prompt
-    const memoryContext = this.memoryManager.getMemoryContext();
+    // Build append prompt (Clawd-specific instructions appended to Claude Code's default)
     const cronInfo = this.getCronSummary();
-    const systemPrompt = buildSystemPrompt(
-      memoryContext,
+    const appendPrompt = buildAppendPrompt(
       { sessionKey, platform },
       cronInfo,
       this.workspace,
+      outputMode,
     );
 
-    // MCP tools need auto-approval (no permission prompt). Built-in tools
-    // go through permission rules + canUseTool — do NOT put them here.
+    // Auto-approve all MCP tools by server name (wildcard).
+    // Built-in tools (Read/Write/Edit/Bash) go through permission rules + canUseTool.
     const autoApprovedTools = [
       ...this.allowedTools,
-      ...this.cronTools,
-      ...this.gatewayTools,
-      ...this.indexingTools,
-      ...this.browserTools,
+      "mcp__cron__*",
+      "mcp__gateway__*",
+      "mcp__knowledge__*",
+      "mcp__browser__*",
+      "mcp__composio__COMPOSIO_SEARCH_TOOLS",
+      "mcp__composio__COMPOSIO_MANAGE_CONNECTIONS",
+      "mcp__composio__COMPOSIO_GET_TOOL_SCHEMAS",
+      "mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL",
+      "mcp__composio__COMPOSIO_REMOTE_BASH_TOOL",
+      // COMPOSIO_REMOTE_WORKBENCH excluded — has proxy_execute that bypasses tool-level gating
+      "mcp__agency__*",
+      // LinkedIn read-only tools (send/write tools gated by HITL in canUseTool)
+      "mcp__linkedin__list_linkedin_chats",
+      "mcp__linkedin__read_linkedin_messages",
+      "mcp__linkedin__get_linkedin_attendees",
+      "mcp__linkedin__list_received_invitations",
+      "mcp__linkedin__list_sent_invitations",
     ];
 
     // Paths to deny — credentials + user data directories.
@@ -385,16 +353,71 @@ export default class ClaudeAgent extends EventEmitter {
     const queryOptions = {
       cwd: this.workspace,
       additionalDirectories: [],
-      tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],  // available built-in tools
+      tools: { type: 'preset', preset: 'claude_code' },  // all built-in tools (Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Task, etc.)
       allowedTools: autoApprovedTools,  // auto-approved (MCP only, skip permission checks)
+      ...(this.model ? { model: this.model } : {}),
+      disallowedTools: ['mcp__claude_ai_*'],  // exclude first-party Anthropic integrations (Gmail, etc.)
       maxTurns: this.maxTurns,
       permissionMode: this.permissionMode,
-      systemPrompt,
+      systemPrompt: {
+        type: 'preset',
+        preset: 'claude_code',
+        append: appendPrompt,
+      },
       includePartialMessages: true,
-      // Safety net: deny anything not approved by permission rules
+      // Safety net: canUseTool fires for anything not resolved by permission rules.
+      // Built-in tools are already gated by permission rules + sandbox.
+      // Only deny unauthorized MCP tools here.
       canUseTool: async (toolName, input, { decisionReason }) => {
-        console.log(`[Permissions] Denied ${toolName}: ${decisionReason || 'outside workspace scope'}`);
-        return { behavior: 'deny', message: 'Operation not permitted — outside workspace scope' };
+        // REMOTE_WORKBENCH — has proxy_execute that bypasses tool-level gating
+        if (toolName === 'mcp__composio__COMPOSIO_REMOTE_WORKBENCH') {
+          if (this.hitl) {
+            console.log('[HITL] Requesting approval for REMOTE_WORKBENCH');
+            const ctx = getGatewayContext()
+            const result = await this.hitl.requestApproval(['REMOTE_WORKBENCH'], {
+              platform: ctx.currentPlatform,
+              sessionKey: ctx.currentSessionKey,
+              chatId: ctx.currentChatId,
+              toolParams: input,
+            });
+            if (result.approved) return { behavior: 'allow', updatedInput: input };
+            return { behavior: 'deny', message: `User denied: REMOTE_WORKBENCH` };
+          }
+          console.log('[Permissions] Blocked COMPOSIO_REMOTE_WORKBENCH');
+          return { behavior: 'deny', message: 'Remote workbench is not permitted' };
+        }
+
+        // LinkedIn write tools — require HITL approval
+        if (toolName === 'mcp__linkedin__send_linkedin_message' ||
+            toolName === 'mcp__linkedin__start_linkedin_chat' ||
+            toolName === 'mcp__linkedin__send_connection_request' ||
+            toolName === 'mcp__linkedin__respond_to_invitation') {
+          if (this.hitl) {
+            const action = toolName.replace('mcp__linkedin__', '')
+            console.log(`[HITL] Requesting approval for LinkedIn: ${action}`)
+            const ctx = getGatewayContext()
+            const result = await this.hitl.requestApproval([action], {
+              platform: ctx.currentPlatform,
+              sessionKey: ctx.currentSessionKey,
+              chatId: ctx.currentChatId,
+              toolParams: input,
+            });
+            if (result.approved) return { behavior: 'allow', updatedInput: input };
+            return { behavior: 'deny', message: `User denied LinkedIn action: ${action}` };
+          }
+          console.log(`[Permissions] Blocked LinkedIn send tool: ${toolName}`);
+          return { behavior: 'deny', message: 'LinkedIn messaging requires HITL approval (HANDOFF_API_KEY not configured)' };
+        }
+
+        // Deny MCP tools not in allowedTools
+        if (toolName.startsWith('mcp__')) {
+          console.log(`[Permissions] Denied MCP tool ${toolName}`);
+          return { behavior: 'deny', message: 'MCP tool not permitted' };
+        }
+
+        // Built-in tools (Read, Write, Bash, WebSearch, WebFetch, Task, etc.) → allow
+        // Already gated by permission rules + sandbox
+        return { behavior: 'allow', updatedInput: input };
       },
       // Inject permission rules via extraArgs → --settings flag
       // SDK merges this with sandbox config into --settings JSON automatically
@@ -414,10 +437,26 @@ export default class ClaudeAgent extends EventEmitter {
               "Read(//tmp/**)",
               "Edit(//tmp/**)",
               "Write(//tmp/**)",
+              // Allow auto memory (Read/Write/Edit to project memory dir)
+              `Read(//${getClaudeProjectDir(this.workspace).replace(/^\//, '')}/memory/**)`,
+              `Edit(//${getClaudeProjectDir(this.workspace).replace(/^\//, '')}/memory/**)`,
+              `Write(//${getClaudeProjectDir(this.workspace).replace(/^\//, '')}/memory/**)`,
               // Allow all Bash (sandbox handles OS-level restrictions)
               "Bash",
             ],
           },
+          // Block built-in claude.ai first-party integrations (Gmail, Calendar, etc.)
+          // These come from the user's OAuth session, not settings files, so
+          // settingSources: ['project'] doesn't exclude them. Block at server level
+          // so they never appear in the model's tool list.
+          deniedMcpServers: [
+            { serverName: "claude_ai_Gmail" },
+            { serverName: "claude_ai_Calendar" },
+            { serverName: "claude_ai_Drive" },
+            { serverName: "claude_ai_Docs" },
+            { serverName: "claude_ai_Sheets" },
+            { serverName: "claude_ai_Slides" },
+          ],
         }),
       },
       sandbox: {
@@ -425,6 +464,7 @@ export default class ClaudeAgent extends EventEmitter {
         autoAllowBashIfSandboxed: true,
         network: {
           allowLocalBinding: true,
+          allowAllUnixSockets: true,
         },
         filesystem: {
           denyRead: [...denyPaths, '.env'],
@@ -432,6 +472,7 @@ export default class ClaudeAgent extends EventEmitter {
             this.workspace,              // ~/clawd workspace
             '/tmp',                      // temp files
             '~/.claude/shell-snapshots', // CLI shell env snapshots
+            getClaudeProjectDir(this.workspace) + '/memory',  // auto memory
           ],
           denyWrite: [
             '.env',          // never write env files even in workspace
@@ -441,16 +482,46 @@ export default class ClaudeAgent extends EventEmitter {
           '*': ['/usr/bin', '/System', '/usr/lib', '/Library'],
         },
       },
-      settingSources: [],
+      settingSources: ['project'],
       env: {
         ...process.env,
+        CLAUDECODE: "",  // prevent "nested session" detection when SDK spawns claude CLI
         ENABLE_TOOL_SEARCH: "true",
       },
+      // MCP servers created fresh per query() call — SDK protocol allows only one
+      // transport per server instance, so concurrent sessions need separate instances.
+      // The underlying state (CronScheduler, gatewayContext, Composio tools) stays shared.
       mcpServers: {
-        cron: this.cronMcpServer,
-        gateway: this.gatewayMcpServer,
-        ...(this.leannMcpServer ? { leann: this.leannMcpServer } : {}),
-        ...mcpServers,
+        ...(() => {
+          try {
+            const server = createCronMcpServer()
+            console.log('[ClaudeAgent] Cron MCP server created successfully')
+            return { cron: server }
+          } catch (err) {
+            console.error('[ClaudeAgent] FAILED to create Cron MCP server:', err)
+            return {}
+          }
+        })(),
+        ...(() => {
+          try {
+            const server = createGatewayMcpServer()
+            console.log('[ClaudeAgent] Gateway MCP server created successfully')
+            return { gateway: server }
+          } catch (err) {
+            console.error('[ClaudeAgent] FAILED to create Gateway MCP server:', err)
+            return {}
+          }
+        })(),
+        ...(this.leannMcpServer ? { knowledge: this.leannMcpServer } : {}),
+        ...(mcpServers.composioTools
+          ? { composio: createSdkMcpServer({ name: 'composio', version: '1.0.0', tools: mcpServers.composioTools }) }
+          : {}),
+        ...(mcpServers.browserServer
+          ? { browser: createBrowserMcpServer(mcpServers.browserServer) }
+          : {}),
+        ...(mcpServers.agency ? { agency: mcpServers.agency } : {}),
+        ...(mcpServers.linkedin ? { linkedin: createLinkedinMcpServer(mcpServers.linkedin) } : {}),
+        // Obsidian MCP removed — memory is nanograph at ~/clawd/graph/
       },
     };
 
@@ -471,75 +542,68 @@ export default class ClaudeAgent extends EventEmitter {
 
     this.emit("run:start", { sessionKey, message, hasImage: !!image });
 
-    try {
-      let fullText = "";
-      let hasStreamedContent = false;
+    // Retry once if session is corrupted (exit code 1 on resume)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        let fullText = "";
+        let hasStreamedContent = false;
 
-      // Use streaming input for MCP compatibility
-      for await (const chunk of query({
-        prompt: this.generateMessages(message, image),
-        options: queryOptions,
-        abortSignal: abortController.signal,
-      })) {
-        // Capture session ID (only on first assignment)
-        if (chunk.type === "system" && chunk.subtype === "init") {
-          const newSessionId = chunk.session_id || chunk.data?.session_id;
-          if (newSessionId && !session.sdkSessionId) {
-            session.sdkSessionId = newSessionId;
-          } else if (newSessionId) {
-            session.sdkSessionId = newSessionId;
-          }
-          continue;
-        }
-
-        // Handle streaming partial messages (token-level streaming)
-        if (chunk.type === "stream_event" && chunk.event) {
-          const event = chunk.event;
-          hasStreamedContent = true;
-
-          // Text delta - stream individual tokens
-          if (
-            event.type === "content_block_delta" &&
-            event.delta?.type === "text_delta"
-          ) {
-            const text = event.delta.text;
-            if (text) {
-              fullText += text;
-              yield { type: "text", content: text };
-              this.emit("run:text", { sessionKey, content: text });
+        for await (const chunk of query({
+          prompt: this.generateMessages(message, image),
+          options: queryOptions,
+          abortSignal: abortController.signal,
+        })) {
+          // Capture session ID
+          if (chunk.type === "system" && chunk.subtype === "init") {
+            const newSessionId = chunk.session_id || chunk.data?.session_id;
+            if (newSessionId) {
+              session.sdkSessionId = newSessionId;
+              this.sessions.save();
             }
+            continue;
           }
-          // Tool use start
-          else if (
-            event.type === "content_block_start" &&
-            event.content_block?.type === "tool_use"
-          ) {
-            yield {
-              type: "tool_use",
-              name: event.content_block.name,
-              input: {},
-              id: event.content_block.id,
-            };
-            this.emit("run:tool", {
-              sessionKey,
-              name: event.content_block.name,
-            });
-          }
-          continue;
-        }
 
-        // Handle complete assistant messages (only if we haven't streamed content)
-        // Skip text blocks since they were already streamed via stream_event
-        if (chunk.type === "assistant" && chunk.message?.content) {
-          for (const block of chunk.message.content) {
-            // Only yield text if we haven't been streaming
-            if (block.type === "text" && block.text && !hasStreamedContent) {
-              fullText += block.text;
-              yield { type: "text", content: block.text };
-              this.emit("run:text", { sessionKey, content: block.text });
-            } else if (block.type === "tool_use") {
-              // Tool use with full input (stream_event only has partial)
-              if (!hasStreamedContent) {
+          // Handle streaming partial messages (token-level streaming)
+          if (chunk.type === "stream_event" && chunk.event) {
+            const event = chunk.event;
+            hasStreamedContent = true;
+
+            if (
+              event.type === "content_block_delta" &&
+              event.delta?.type === "text_delta"
+            ) {
+              const text = event.delta.text;
+              if (text) {
+                fullText += text;
+                yield { type: "text", content: text };
+                this.emit("run:text", { sessionKey, content: text });
+              }
+            } else if (
+              event.type === "content_block_start" &&
+              event.content_block?.type === "tool_use"
+            ) {
+              yield {
+                type: "tool_use",
+                name: event.content_block.name,
+                input: {},
+                id: event.content_block.id,
+              };
+              this.emit("run:tool", {
+                sessionKey,
+                name: event.content_block.name,
+              });
+            }
+            continue;
+          }
+
+          // Handle complete assistant messages (only if we haven't streamed content)
+          if (chunk.type === "assistant" && chunk.message?.content) {
+            for (const block of chunk.message.content) {
+              if (block.type === "text" && block.text && !hasStreamedContent) {
+                fullText += block.text;
+                yield { type: "text", content: block.text };
+                this.emit("run:text", { sessionKey, content: block.text });
+              } else if (block.type === "tool_use" && !hasStreamedContent) {
                 yield {
                   type: "tool_use",
                   name: block.name,
@@ -549,37 +613,44 @@ export default class ClaudeAgent extends EventEmitter {
                 this.emit("run:tool", { sessionKey, name: block.name });
               }
             }
+            continue;
           }
-          continue;
+
+          if (chunk.type === "tool_result" || chunk.type === "result") {
+            yield { type: "tool_result", result: chunk.result || chunk.content };
+            continue;
+          }
+
+          if (chunk.type !== "system") {
+            yield chunk;
+          }
         }
 
-        // Handle tool results
-        if (chunk.type === "tool_result" || chunk.type === "result") {
-          yield { type: "tool_result", result: chunk.result || chunk.content };
-          continue;
+        yield { type: "done", fullText };
+        this.emit("run:complete", { sessionKey, response: fullText });
+        break; // success — exit retry loop
+      } catch (error) {
+        if (error.name === "AbortError") {
+          console.log("[ClaudeAgent] Aborted:", sessionKey);
+          yield { type: "aborted" };
+          this.emit("run:aborted", { sessionKey });
+          break;
         }
-
-        if (chunk.type !== "system") {
-          yield chunk;
+        // Corrupted session — clear and retry once
+        if (attempt === 0 && queryOptions.resume && error.message?.includes("exited with code 1")) {
+          console.warn(`[ClaudeAgent] Session ${queryOptions.resume} appears corrupted, starting fresh`);
+          session.sdkSessionId = null;
+          this.sessions.save();
+          delete queryOptions.resume;
+          continue; // retry
         }
-      }
-
-      yield { type: "done", fullText };
-      this.emit("run:complete", { sessionKey, response: fullText });
-    } catch (error) {
-      if (error.name === "AbortError") {
-        console.log("[ClaudeAgent] Aborted:", sessionKey);
-        yield { type: "aborted" };
-        this.emit("run:aborted", { sessionKey });
-      } else {
         console.error("[ClaudeAgent] Error:", error);
         yield { type: "error", error: error.message };
         this.emit("run:error", { sessionKey, error });
         throw error;
       }
-    } finally {
-      this.abortControllers.delete(sessionKey);
     }
+    this.abortControllers.delete(sessionKey);
   }
 
   /**

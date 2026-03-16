@@ -2,18 +2,10 @@ import fs from 'fs'
 import path from 'path'
 import os from 'os'
 import { parseTranscriptFile } from './transcript-parser.js'
+import { workspaceToProjectDir } from '../utils.js'
 
 const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects')
 const DEBOUNCE_MS = 30_000 // 30s — sessions write constantly, no need to re-parse every keystroke
-
-/**
- * Convert a workspace path to Claude Code's project directory name.
- * e.g. /Users/parthmodi/clawd → -Users-parthmodi-clawd
- */
-function workspaceToProjectDir(workspace) {
-  const resolved = path.resolve(workspace)
-  return resolved.replace(/\//g, '-')
-}
 
 /**
  * Discover Claude Code session .jsonl files for a specific workspace.

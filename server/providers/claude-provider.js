@@ -55,7 +55,8 @@ export class ClaudeProvider extends BaseProvider {
       chatId,
       mcpServers = {},
       allowedTools = this.defaultAllowedTools,
-      maxTurns = this.defaultMaxTurns
+      maxTurns = this.defaultMaxTurns,
+      model = null
     } = params;
 
     // Build query options - exact match to server.js structure
@@ -63,8 +64,9 @@ export class ClaudeProvider extends BaseProvider {
       allowedTools,
       maxTurns,
       mcpServers,
-      permissionMode: this.permissionMode,
-      settingSources: ['user', 'project']  // Enable Skills from filesystem
+      model, // Pass model to SDK
+      permissionMode: this.permissionMode
+      // Removed settingSources and betas for better LMStudio compatibility
     };
 
     // Check for existing session - matches server.js session resumption logic

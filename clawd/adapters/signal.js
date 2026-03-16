@@ -130,6 +130,7 @@ export default class SignalAdapter extends BaseAdapter {
       text,
       isGroup,
       sender,
+      senderName: envelope.sourceName || null,
       mentions: isMentioned ? ['self'] : [],
       image: null, // TODO: Handle attachments
       raw: envelope

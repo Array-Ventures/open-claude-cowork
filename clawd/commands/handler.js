@@ -1,6 +1,6 @@
 /**
  * Slash command handler for Clawd
- * Processes commands like /new, /reset, /status, /memory
+ * Processes commands like /new, /reset, /status
  */
 export default class CommandHandler {
   constructor(gateway) {
@@ -48,9 +48,6 @@ export default class CommandHandler {
       case 'status':
         return this.handleStatus(sessionKey)
 
-      case 'memory':
-        return this.handleMemory(args)
-
       case 'queue':
         return this.handleQueue()
 
@@ -74,7 +71,7 @@ export default class CommandHandler {
     const sessionManager = this.gateway.sessionManager
     const agentRunner = this.gateway.agentRunner
 
-    // Delete session from agent
+    // Delete session from agent (SessionStore auto-saves on delete)
     if (agentRunner.agent.sessions.has(sessionKey)) {
       agentRunner.agent.sessions.delete(sessionKey)
     }
@@ -107,64 +104,6 @@ export default class CommandHandler {
       `*Queue:* ${queueStatus.pending} pending${queueStatus.processing ? ' (processing)' : ''}`,
       '',
       `*Global:* ${globalStats.totalProcessed} processed, ${globalStats.totalFailed} failed`
-    ]
-
-    return {
-      handled: true,
-      response: lines.join('\n')
-    }
-  }
-
-  handleMemory(args) {
-    const memoryManager = this.gateway.agentRunner.agent.memoryManager
-
-    if (args === 'list') {
-      const files = memoryManager.listDailyFiles()
-      const lines = [
-        '📝 *Memory Files*',
-        '',
-        `*MEMORY.md:* ${memoryManager.readLongTermMemory() ? 'exists' : 'empty'}`,
-        '',
-        '*Daily logs:*',
-        ...files.slice(0, 10).map(f => `  • ${f}`)
-      ]
-      if (files.length > 10) {
-        lines.push(`  ... and ${files.length - 10} more`)
-      }
-      return { handled: true, response: lines.join('\n') }
-    }
-
-    if (args.startsWith('search ')) {
-      const query = args.slice(7)
-      const results = memoryManager.searchMemory(query)
-      if (results.length === 0) {
-        return { handled: true, response: `🔍 No results for "${query}"` }
-      }
-      const lines = [
-        `🔍 *Search: "${query}"*`,
-        ''
-      ]
-      for (const result of results.slice(0, 5)) {
-        lines.push(`*${result.file}:*`)
-        for (const match of result.matches.slice(0, 2)) {
-          lines.push(`  Line ${match.line}: ${match.context.substring(0, 100)}...`)
-        }
-      }
-      return { handled: true, response: lines.join('\n') }
-    }
-
-    // Show today's memory
-    const today = memoryManager.readTodayMemory()
-    const longTerm = memoryManager.readLongTermMemory()
-
-    const lines = [
-      '🧠 *Memory*',
-      '',
-      '*Long-term (MEMORY.md):*',
-      longTerm ? longTerm.substring(0, 500) + (longTerm.length > 500 ? '...' : '') : 'Empty',
-      '',
-      '*Today:*',
-      today ? today.substring(0, 500) + (today.length > 500 ? '...' : '') : 'No notes yet'
     ]
 
     return {
@@ -256,9 +195,6 @@ export default class CommandHandler {
       '',
       '`/new` or `/reset` - Start fresh session',
       '`/status` - Show session status',
-      '`/memory` - Show memory summary',
-      '`/memory list` - List memory files',
-      '`/memory search <query>` - Search memories',
       '`/queue` - Show queue status',
       '`/stop` - Stop current operation',
       '`/reindex` - Rebuild workspace index',

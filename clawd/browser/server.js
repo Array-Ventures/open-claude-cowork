@@ -24,15 +24,23 @@ export default class BrowserServer {
   }
 
   /**
-   * Start the browser based on mode
+   * Start the browser based on mode (idempotent — safe to call multiple times)
    */
   async start() {
-    if (this.mode === 'clawd') {
-      await this.startClawdBrowser()
-    } else if (this.mode === 'chrome') {
-      await this.connectToChrome()
-    }
-    return this
+    if (this.context) return this
+    if (this._starting) return this._starting
+
+    this._starting = (async () => {
+      if (this.mode === 'clawd') {
+        await this.startClawdBrowser()
+      } else if (this.mode === 'chrome') {
+        await this.connectToChrome()
+      }
+      this._starting = null
+      return this
+    })()
+
+    return this._starting
   }
 
   /**
@@ -104,6 +112,7 @@ export default class BrowserServer {
    * Stop the browser
    */
   async stop() {
+    this._starting = null
     if (this.httpServer) {
       this.httpServer.close()
     }

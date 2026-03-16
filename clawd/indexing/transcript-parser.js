@@ -1,8 +1,6 @@
 import fs from 'fs'
 import path from 'path'
 
-const TOOL_OUTPUT_LIMIT = 500
-
 /**
  * Parse a Claude Code .jsonl session file into readable markdown.
  */
@@ -141,11 +139,11 @@ function extractAssistantContent(entry, toolResultMap) {
     } else if (block?.type === 'tool_use') {
       const tu = {
         tool: block.name,
-        input: summarizeToolInput(block.name, block.input || {}),
+        input: JSON.stringify(block.input || {}),
       }
       const result = toolResultMap.get(block.id)
       if (result) {
-        tu.output = truncate(result.text, TOOL_OUTPUT_LIMIT)
+        tu.output = result.text
         tu.isError = result.isError
       }
       toolUses.push(tu)
@@ -158,40 +156,6 @@ function extractAssistantContent(entry, toolResultMap) {
     role: 'assistant',
     text: textParts.join('\n\n') || null,
     toolUses: toolUses.length > 0 ? toolUses : null,
-  }
-}
-
-/**
- * Summarize tool input to a short human-readable string.
- */
-function summarizeToolInput(toolName, input) {
-  switch (toolName) {
-    case 'Read':
-      return input.file_path || ''
-    case 'Write':
-      return input.file_path || ''
-    case 'Edit':
-      return input.file_path || ''
-    case 'Bash':
-      return input.command ? truncate(input.command, 200) : ''
-    case 'Glob':
-      return input.pattern || ''
-    case 'Grep':
-      return input.pattern ? `/${input.pattern}/` : ''
-    case 'WebSearch':
-      return input.query || ''
-    case 'WebFetch':
-      return input.url || ''
-    case 'Task':
-      return input.prompt ? truncate(input.prompt, 100) : ''
-    default:
-      // For MCP tools and others, show first meaningful string value
-      for (const [k, v] of Object.entries(input)) {
-        if (typeof v === 'string' && v.length > 0) {
-          return truncate(v, 100)
-        }
-      }
-      return ''
   }
 }
 
@@ -228,9 +192,11 @@ function formatSession(metadata, messages) {
       }
       if (msg.toolUses) {
         for (const tu of msg.toolUses) {
-          const inputSummary = tu.input ? ` → \`${tu.input}\`` : ''
           lines.push(``)
-          lines.push(`**Tool: ${tu.tool}**${inputSummary}`)
+          lines.push(`**Tool: ${tu.tool}**`)
+          lines.push('```')
+          lines.push(tu.input)
+          lines.push('```')
           if (tu.output) {
             const prefix = tu.isError ? '[ERROR] ' : ''
             lines.push('```')
@@ -252,9 +218,4 @@ function updateTimeBounds(metadata, ts) {
   if (!ts) return
   if (!metadata.startTime || ts < metadata.startTime) metadata.startTime = ts
   if (!metadata.endTime || ts > metadata.endTime) metadata.endTime = ts
-}
-
-function truncate(str, maxLen) {
-  if (!str || str.length <= maxLen) return str
-  return str.slice(0, maxLen) + '...'
 }

@@ -76,7 +76,7 @@ export default class AgentRunner extends EventEmitter {
   /**
    * Enqueue a run for a session
    */
-  async enqueueRun(sessionKey, message, adapter, chatId, image = null) {
+  async enqueueRun(sessionKey, message, adapter, chatId, image = null, meta = {}) {
     if (!this.queues.has(sessionKey)) {
       this.queues.set(sessionKey, { items: [], processing: false })
     }
@@ -92,6 +92,7 @@ export default class AgentRunner extends EventEmitter {
         adapter,
         chatId,
         image,
+        meta,
         mcpServers: this.mcpServers || {},
         resolve,
         reject,
@@ -180,14 +181,37 @@ export default class AgentRunner extends EventEmitter {
   /**
    * Execute a single agent run with streaming messages
    */
+  /**
+   * Build a message prefix with sender metadata
+   */
+  buildMessagePrefix(meta) {
+    if (!meta || !meta.sender) return ''
+    const parts = []
+    const name = meta.senderName ? `${meta.senderName} (${meta.sender})` : meta.sender
+    parts.push(`From: ${name}`)
+    parts.push(`on ${meta.platform || 'unknown'}`)
+    if (meta.isGroup) {
+      const group = meta.groupName ? `${meta.groupName} (${meta.chatId || ''})` : (meta.chatId || 'unknown')
+      parts.push(`group: ${group}`)
+    }
+    return `[${parts.join(', ')}]\n`
+  }
+
+  /**
+   * Execute a single agent run with streaming messages
+   */
   async executeRun(run) {
-    const { sessionKey, message, adapter, chatId, image, mcpServers } = run
+    const { sessionKey, message, adapter, chatId, image, meta, mcpServers } = run
     const platform = this.extractPlatform(sessionKey)
+
+    // Build prefixed message with sender metadata
+    const prefix = this.buildMessagePrefix({ ...meta, chatId })
+    const prefixedMessage = prefix + message
 
     // Record user message in transcript
     this.sessionManager.appendTranscript(sessionKey, {
       role: 'user',
-      content: message,
+      content: prefixedMessage,
       hasImage: !!image
     })
 
@@ -196,12 +220,13 @@ export default class AgentRunner extends EventEmitter {
       let fullText = ''
 
       for await (const chunk of this.agent.run({
-        message,
+        message: prefixedMessage,
         sessionKey,
         platform,
         chatId,
         image,
-        mcpServers
+        mcpServers,
+        outputMode: 'interactive'
       })) {
         // Accumulate text
         if (chunk.type === 'text') {

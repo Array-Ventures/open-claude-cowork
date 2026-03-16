@@ -10,7 +10,10 @@ import SessionManager from './sessions/manager.js'
 import AgentRunner from './agent/runner.js'
 import CommandHandler from './commands/handler.js'
 import { Composio } from '@composio/core'
-import { BrowserServer, createBrowserMcpServer } from './browser/index.js'
+import { ClaudeAgentSDKProvider } from '@composio/claude-agent-sdk'
+import { BrowserServer } from './browser/index.js'
+import { HITLApproval } from './auth/hitl.js'
+import { getGatewayContext } from './tools/gateway.js'
 
 /**
  * Clawd Gateway - Routes messages between messaging platforms and Claude agent
@@ -18,15 +21,19 @@ import { BrowserServer, createBrowserMcpServer } from './browser/index.js'
 class Gateway {
   constructor() {
     this.sessionManager = new SessionManager()
+    this.hitl = config.handoff?.enabled ? new HITLApproval(config.handoff) : null
+    if (this.hitl) console.log('[HITL] Handoff approval enabled')
+
     this.agentRunner = new AgentRunner(this.sessionManager, {
       workspace: config.agent?.workspace,
       allowedTools: config.agent?.allowedTools || [],
       maxTurns: config.agent?.maxTurns || 50,
       indexing: config.indexing,
+      hitl: this.hitl,
     })
     this.commandHandler = new CommandHandler(this)
     this.adapters = new Map()
-    this.composio = new Composio()
+    this.composio = new Composio({ provider: new ClaudeAgentSDKProvider() })
     this.composioSession = null
     this.browserServer = null
     this.mcpServers = {}
@@ -40,12 +47,47 @@ class Gateway {
     console.log('[Composio] Initializing session for:', userId)
     try {
       this.composioSession = await this.composio.create(userId)
-      this.mcpServers.composio = {
-        type: 'http',
-        url: this.composioSession.mcp.url,
-        headers: this.composioSession.mcp.headers
-      }
-      console.log('[Composio] Session ready')
+
+      const sensitiveActions = config.agent?.sensitiveActions || []
+      const hitl = this.hitl
+
+      const tools = await this.composioSession.tools({
+        beforeExecute: async ({ toolSlug, sessionId, params }) => {
+          console.log(`[Composio:beforeExecute] toolSlug=${toolSlug} sessionId=${sessionId}`)
+          console.log(`[Composio:beforeExecute] params:`, JSON.stringify(params, null, 2)?.substring(0, 500))
+          // session.tools() returns meta tools — beforeExecute fires per meta tool slug.
+          // Parse meta tool params to find sensitive individual tool slugs.
+          if (toolSlug === 'COMPOSIO_MULTI_EXECUTE_TOOL') {
+            const blocked = (params?.tools || [])
+              .map(t => t.tool_slug)
+              .filter(slug => slug && sensitiveActions.includes(slug))
+            if (blocked.length) {
+              if (hitl) {
+                console.log(`[HITL] Requesting approval for: ${blocked.join(', ')}`)
+                const ctx = getGatewayContext()
+                const result = await hitl.requestApproval(blocked, {
+                  platform: ctx.currentPlatform,
+                  sessionKey: ctx.currentSessionKey,
+                  chatId: ctx.currentChatId,
+                  toolParams: params,
+                })
+                if (result.approved) {
+                  console.log(`[HITL] Approved: ${blocked.join(', ')}`)
+                  return params
+                }
+                throw new Error(`User denied: ${blocked.join(', ')}`)
+              }
+              throw new Error(`Blocked sensitive actions: ${blocked.join(', ')}`)
+            }
+          }
+          return params
+        }
+      })
+
+      // Store raw tools array — MCP server is created per query() call to avoid
+      // "Already connected to a transport" crash with concurrent sessions
+      this.mcpServers.composioTools = tools
+      console.log(`[Composio] Session ready with ${tools.length} tools`)
     } catch (err) {
       console.error('[Composio] Failed to initialize:', err.message)
     }
@@ -55,7 +97,8 @@ class Gateway {
 
       try {
         this.browserServer = new BrowserServer(config.browser)
-        this.mcpServers.browser = createBrowserMcpServer(this.browserServer)
+        // Store ref — MCP server created per query() call
+        this.mcpServers.browserServer = this.browserServer
         console.log('[Browser] Ready')
       } catch (err) {
         console.error('[Browser] Failed to initialize:', err.message)
@@ -63,6 +106,42 @@ class Gateway {
           console.error('[Browser] Make sure Chrome is running with --remote-debugging-port=' + (config.browser.chrome?.cdpPort || 9222))
         }
       }
+    }
+
+    // LinkedIn messaging via Unipile
+    if (config.unipile?.enabled) {
+      let accountName = null
+      try {
+        const res = await fetch(
+          `${config.unipile.baseUrl}/api/v1/accounts/${config.unipile.accountId}`,
+          { headers: { 'X-API-KEY': config.unipile.apiKey, 'Accept': 'application/json' } }
+        )
+        if (res.ok) {
+          const data = await res.json()
+          accountName = data.name || null
+        }
+      } catch (err) {
+        console.warn('[LinkedIn] Failed to fetch account name:', err.message)
+      }
+      this.mcpServers.linkedin = {
+        baseUrl: config.unipile.baseUrl,
+        apiKey: config.unipile.apiKey,
+        accountId: config.unipile.accountId,
+        accountName,
+      }
+      console.log(`[LinkedIn] Unipile MCP server enabled${accountName ? ` (${accountName})` : ''}`)
+    }
+
+    // Agency CRM MCP (API key auth)
+    if (process.env.AGENCY_API_KEY) {
+      this.mcpServers.agency = {
+        type: 'http',
+        url: 'https://mcp.agency.inc/',
+        headers: {
+          Authorization: `Bearer ${process.env.AGENCY_API_KEY}`
+        }
+      }
+      console.log('[Agency] MCP server configured')
     }
   }
 
@@ -94,37 +173,117 @@ class Gateway {
     })
   }
 
+  async setupTriggerSubscription() {
+    if (!this.composio || !config.triggers?.length) {
+      console.log(`[Triggers] Skipped: composio=${!!this.composio}, triggers=${config.triggers?.length || 0}`)
+      return
+    }
+
+    const scheduler = this.agentRunner.agent.cronScheduler
+    const userId = config.agentId || 'clawd-user'
+
+    // Helper: register a trigger with Composio and store the instance ID on the job
+    const registerTrigger = async (job) => {
+      const result = await this.composio.triggers.create(userId, job.slug, { triggerConfig: job.triggerConfig })
+      // Store Composio's trigger instance ID for later disable/delete
+      job.composioTriggerId = result.triggerId
+      scheduler.saveJobs()
+      console.log(`[Triggers] Synced with Composio: ${job.slug} (id: ${result.triggerId})`)
+    }
+
+    // Register active trigger jobs with Composio
+    const activeTriggers = Array.from(scheduler.jobs.values()).filter(j => j.type === 'trigger')
+    for (const job of activeTriggers) {
+      try {
+        await registerTrigger(job)
+      } catch (err) {
+        console.error(`[Triggers] Failed to register ${job.slug}:`, err.message)
+      }
+    }
+
+    // Listen for runtime trigger creation/cancellation
+    scheduler.on('trigger:created', async (job) => {
+      try {
+        await registerTrigger(job)
+      } catch (err) {
+        console.error(`[Triggers] Failed to register ${job.slug}:`, err.message)
+      }
+    })
+
+    scheduler.on('trigger:cancelled', async (job) => {
+      const composioId = job.composioTriggerId
+      if (!composioId) {
+        console.log(`[Triggers] No Composio ID stored for ${job.slug}, skipping disable`)
+        return
+      }
+      try {
+        await this.composio.triggers.disable(composioId)
+        console.log(`[Triggers] Disabled on Composio: ${job.slug} (id: ${composioId})`)
+      } catch (err) {
+        if (err.message?.includes('410') || err.message?.includes('not found')) {
+          console.log(`[Triggers] Already removed on Composio: ${job.slug}`)
+        } else {
+          console.error(`[Triggers] Failed to disable ${job.slug}:`, err.message)
+        }
+      }
+    })
+
+    // Subscribe to all trigger events via Pusher
+    await this.composio.triggers.subscribe((data) => {
+      const triggerSlug = data.triggerSlug
+      const job = Array.from(scheduler.jobs.values()).find(j => j.type === 'trigger' && j.slug === triggerSlug)
+      if (!job) {
+        console.log(`[Triggers] Ignoring event for unregistered trigger: ${triggerSlug}`)
+        return
+      }
+      console.log(`[Triggers] Event: ${triggerSlug}`)
+      const enrichedMessage = `${job.message}\n\nTrigger: ${triggerSlug}\nPayload:\n${JSON.stringify(data.payload, null, 2)}`
+      scheduler.executeJob(job, enrichedMessage)
+    }, { userId })
+
+    console.log(`[Triggers] Pusher subscription active (${activeTriggers.length} triggers registered)`)
+  }
+
   setupCronExecution() {
     // Handle cron job execution - send scheduled messages or invoke agent
-    this.agentRunner.agent.cronScheduler.on('execute', async ({ jobId, platform, chatId, sessionKey, message, invokeAgent }) => {
-      console.log(`[Cron] ⏰ Executing job ${jobId}${invokeAgent ? ' (invoking agent)' : ''}`)
+    this.agentRunner.agent.cronScheduler.on('execute', async ({ jobId, platform, chatId, sessionKey, message, invokeAgent, silent }) => {
+      console.log(`[Cron] ⏰ Executing job ${jobId}${invokeAgent ? ' (invoking agent)' : ''}${silent ? ' (silent)' : ''}`)
 
-      const adapter = this.adapters.get(platform)
-      if (!adapter) {
+      const adapter = platform ? this.adapters.get(platform) : null
+      if (!adapter && !invokeAgent) {
         console.error(`[Cron] No adapter for platform: ${platform}`)
         return
       }
 
       try {
         if (invokeAgent) {
-          // Run the agent with the message and send the response
-          console.log(`[Cron] Invoking agent with: ${message}`)
+          // Run the agent with the message
+          // Silent mode: agent uses gateway tools to send messages explicitly
+          const isSilent = silent || !chatId
+          // Fresh session per execution — never resume a user's chat session
+          const cronSessionKey = `cron:${jobId}:${Date.now()}`
+          console.log(`[Cron] Invoking agent with: ${message} (${isSilent ? 'silent' : 'interactive'}, session: ${cronSessionKey})`)
           const response = await this.agentRunner.agent.runAndCollect({
             message,
-            sessionKey: sessionKey || `cron:${jobId}`,
+            sessionKey: cronSessionKey,
             platform,
             chatId,
-            mcpServers: this.mcpServers
+            mcpServers: this.mcpServers,
+            outputMode: isSilent ? 'silent' : 'interactive'
           })
+          // Clean up ephemeral cron session
+          this.agentRunner.agent.sessions.delete(cronSessionKey)
 
-          if (response) {
+          if (response && !isSilent) {
             await adapter.sendMessage(chatId, response)
             console.log(`[Cron] Agent response sent for job ${jobId}`)
           }
-        } else {
+        } else if (adapter) {
           // Just send the message directly
           await adapter.sendMessage(chatId, message)
           console.log(`[Cron] Message sent for job ${jobId}`)
+        } else {
+          console.error(`[Cron] Cannot send message — no adapter for platform: ${platform}`)
         }
       } catch (err) {
         console.error(`[Cron] Failed to execute job:`, err.message)
@@ -153,7 +312,7 @@ class Gateway {
       if (installed) {
         const leannConfig = indexer.getLeannMcpServerConfig()
         if (leannConfig) {
-          this.mcpServers.leann = leannConfig
+          this.mcpServers.knowledge = leannConfig
           this.agentRunner.setMcpServers(this.mcpServers)
           console.log('[Indexing] LEANN MCP server registered')
         }
@@ -221,6 +380,26 @@ class Gateway {
       }
     }
 
+    // Register heartbeat cron job (silent mode — agent uses gateway tools to send)
+    if (config.heartbeat?.enabled) {
+      const scheduler = this.agentRunner.agent.cronScheduler
+      scheduler.scheduleCron({
+        id: 'heartbeat',
+        platform: null,
+        chatId: null,
+        sessionKey: 'cron:heartbeat',
+        message: config.heartbeat.prompt,
+        cron: config.heartbeat.cron,
+        description: 'Heartbeat — silent agent check-in',
+        invokeAgent: true,
+        silent: true
+      })
+      console.log(`[Heartbeat] Registered: ${config.heartbeat.cron}`)
+    }
+
+    // Setup Composio trigger subscription
+    await this.setupTriggerSubscription()
+
     // Handle shutdown
     process.on('SIGINT', () => this.stop())
     process.on('SIGTERM', () => this.stop())
@@ -228,7 +407,7 @@ class Gateway {
     console.log('')
     console.log('[Gateway] Ready and listening for messages')
     console.log('[Gateway] Using Claude Agent SDK with memory + cron + Composio + Browser')
-    console.log('[Gateway] Commands: /help, /new, /status, /memory, /stop')
+    console.log('[Gateway] Commands: /help, /new, /status, /stop')
   }
 
   setupAdapter(adapter, platform, platformConfig) {
@@ -278,7 +457,8 @@ class Gateway {
           message.text,
           adapter,
           message.chatId,
-          message.image  // Pass image if present
+          message.image,  // Pass image if present
+          { sender: message.sender, senderName: message.senderName, isGroup: message.isGroup, groupName: message.groupName, platform }
         )
 
         if (adapter.stopTyping) {

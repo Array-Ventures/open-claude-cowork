@@ -21,7 +21,8 @@ export default class WhatsAppAdapter extends BaseAdapter {
     super(config)
     this.sock = null
     this.myJid = null
-    this.jidMap = new Map() 
+    this.jidMap = new Map()
+    this.groupNameCache = new Map()
   }
 
   async start() {
@@ -62,7 +63,8 @@ export default class WhatsAppAdapter extends BaseAdapter {
 
       if (connection === 'open') {
         this.myJid = this.sock.user?.id
-        console.log(`[WhatsApp] Connected as ${this.myJid}`)
+        this.myLid = this.sock.user?.lid
+        console.log(`[WhatsApp] Connected as ${this.myJid} (lid: ${this.myLid || 'none'})`)
       }
     })
 
@@ -180,18 +182,47 @@ export default class WhatsAppAdapter extends BaseAdapter {
 
     if (!text && !image) return
 
-    // Extract mentions
-    const mentions = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
-    const isMentioned = this.myJid && mentions.some(m =>
-      m.split('@')[0] === this.myJid.split('@')[0] ||
-      m.split(':')[0] === this.myJid.split(':')[0]
-    )
+    // Extract mentions — contextInfo lives on the specific message type, not just extendedTextMessage
+    const contextInfo =
+      msg.message?.extendedTextMessage?.contextInfo ||
+      msg.message?.imageMessage?.contextInfo ||
+      msg.message?.videoMessage?.contextInfo ||
+      msg.message?.documentMessage?.contextInfo ||
+      {}
+    const mentions = contextInfo.mentionedJid || []
+    const isMentioned = mentions.some(m => {
+      const mId = m.split('@')[0].split(':')[0]
+      if (this.myJid) {
+        const jidId = this.myJid.split('@')[0].split(':')[0]
+        if (mId === jidId) return true
+      }
+      if (this.myLid) {
+        const lidId = this.myLid.split('@')[0].split(':')[0]
+        if (mId === lidId) return true
+      }
+      return false
+    })
+
+    // Get group name (cached)
+    let groupName = null
+    if (isGroup) {
+      groupName = this.groupNameCache.get(jid)
+      if (!groupName && this.sock) {
+        try {
+          const meta = await this.sock.groupMetadata(jid)
+          groupName = meta?.subject || null
+          if (groupName) this.groupNameCache.set(jid, groupName)
+        } catch {}
+      }
+    }
 
     const message = {
       chatId: jid,
       text,
       isGroup,
       sender,
+      senderName: msg.pushName || null,
+      groupName,
       mentions: isMentioned ? ['self'] : mentions,
       image,
       raw: msg

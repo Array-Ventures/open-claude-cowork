@@ -134,11 +134,16 @@ export default class TelegramAdapter extends BaseAdapter {
       text = text.replace(`@${this.botInfo.username}`, '').trim()
     }
 
+    const senderName = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || null
+    const groupName = isGroup ? (msg.chat.title || null) : null
+
     const message = {
       chatId,
       text,
       isGroup,
       sender,
+      senderName,
+      groupName,
       mentions: botMentioned ? ['self'] : [],
       image,
       raw: msg

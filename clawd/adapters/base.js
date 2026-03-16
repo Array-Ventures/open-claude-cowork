@@ -60,26 +60,31 @@ export default class BaseAdapter {
    * @returns {boolean}
    */
   shouldRespond(message, config) {
-    const { chatId, isGroup, mentions } = message
+    const { chatId, isGroup, mentions, sender } = message
 
     if (isGroup) {
       // Check group allowlist
       if (config.allowedGroups.length === 0) {
+        console.log(`[Filter] Skipped group ${chatId} from ${sender || 'unknown'} (no groups allowed)`)
         return false
       }
       if (!config.allowedGroups.includes('*') && !config.allowedGroups.includes(chatId)) {
+        console.log(`[Filter] Skipped group ${chatId} from ${sender || 'unknown'} (not in allowedGroups)`)
         return false
       }
       // Check mention gating for groups
       if (config.respondToMentionsOnly && mentions && !mentions.includes('self')) {
+        console.log(`[Filter] Skipped group ${chatId} from ${sender || 'unknown'} (not mentioned)`)
         return false
       }
     } else {
       // Check DM allowlist
       if (config.allowedDMs.length === 0) {
+        console.log(`[Filter] Skipped DM from ${chatId} (no DMs allowed)`)
         return false
       }
       if (!config.allowedDMs.includes('*') && !config.allowedDMs.includes(chatId)) {
+        console.log(`[Filter] Skipped DM from ${chatId} (not in allowedDMs)`)
         return false
       }
     }

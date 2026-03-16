@@ -122,6 +122,7 @@ export default class iMessageAdapter extends BaseAdapter {
       text,
       isGroup: Boolean(isGroup),
       sender,
+      senderName: msg.sender_name || msg.handle_id || null,
       mentions,
       raw: msg
     }

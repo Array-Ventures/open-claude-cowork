@@ -14,10 +14,12 @@
     "cli": "node cli.js"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
-    "@composio/core": "^0.6.3",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.74",
+    "@composio/claude-agent-sdk": "^0.6.4",
+    "@composio/core": "^0.6.4",
     "@huggingface/transformers": "^3.8.1",
     "@whiskeysockets/baileys": "^6.7.16",
+    "croner": "^10.0.1",
     "node-telegram-bot-api": "^0.66.0",
     "oh-my-logo": "^0.4.0",
     "pino": "^9.6.0",
